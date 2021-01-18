@@ -1,0 +1,248 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Gerson Guilhem"
+date: "1/17/2021"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Executive Summary
+
+This report is a completion course work from JHU Data Science Specialization in Coursera.
+The goal is to build a model that can predict how well a individuals do their physical activities.
+
+According to the owners of the dataset [Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.], data were collected in the following way:
+
+_"Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E)."_ <font size=1.5><br>
+*Read more: http:/groupware.les.inf.puc-rio.br/har#ixzz4TjwzUvQ1*</font>
+
+According to the assignment description in Coursera, the problem statement is as follows: _"One thing that people regularly do is quantify how  much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants."_
+
+This report will describe all the processes that lead to the final prediction model, covering all the model building steps with details on each one. In the end, the random forest algorithm on the non-PCA variables was the model that performed better on this task.
+
+## Data Cleaning and EDA
+
+Both training and test sets were already provided in the assignment. An important observation is that the test set does not have the outcome variable we're interested in (variable **_classe_**). This is because the students needed to evaluate their model accuracy on the test set through a graded quiz in ths course portal. With that being said, let's load both sets:
+```{r load_data, echo=TRUE, cache=TRUE}
+train <- read.csv(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+test <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+```
+
+The first step was to have a grasp on the data structure:
+```{r data_str, echo=TRUE}
+str(train)
+```
+
+We see that we have lots of rows (19,622) and 160 different variables.
+The first seven variables don't seem to be interesting for our prediction purpose:
+
+- X is a variable describing each row of the dataset
+- username, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window and num_window are variables related to the **study design** and are not variables that come from the body sensors placed in the subjects. These should be dropped since they will not be present in any new data that comes from outside this study.
+``` {r drop_discrete_vars, warning=FALSE, message=FALSE}
+library(dplyr)
+
+train <- train %>% 
+    select(-c(X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, 
+              cvtd_timestamp, new_window, num_window))
+```
+Another fact seems to need adjustment: apparently some numeric columns are being interpreted as factors (e.g. kurtosis_roll_belt) and because of that, empty values are not being treated as such. Since we got rid of all study design variables, all remaining ones come from the body sensors and should all be numeric. We'll first identify all columns that are treated are factors and change them to a numeric data type.
+``` {r convert_fct_to_num, cache=TRUE, message=FALSE, warning=FALSE}
+# Identify factor columns (excluding our outcome variable) and get their names
+factor.columns <- train %>% select(-classe) %>% select_if(is.factor) %>% colnames()
+
+# Loop through all factor columns and convert them to numeric
+for (i in 1:length(factor.columns)) {
+    levels(train[, factor.columns[i]]) <- as.numeric(levels(train[, factor.columns[i]]))
+    train[, factor.columns[i]] <- train[, factor.columns[i]] %>%
+        as.character() %>%
+        as.numeric()
+}
+```
+Now we can check if we have missing variables in the data and which columns have the highest rate of missing values.
+``` {r missing_vars}
+# Check missing ratio on the train set
+missing.ratio.df <- as.data.frame(colMeans(is.na(train)))
+colnames(missing.ratio.df) <- "Missing.Ratio"
+
+# Filter only columns that have missing values
+missing.ratio.df <- missing.ratio.df %>% arrange(desc(Missing.Ratio)) %>% filter(Missing.Ratio > 0)
+
+# Display summary of columns that have missing values
+summary(missing.ratio.df)
+```
+We can see that the columns that contain missing values have a missing ratio ranging from 97.9% to 100%. This makes these columns almost useless to our prediction task. Using the command `nrow(missing.ratio.df)` we see that we have `r nrow(missing.ratio.df)` columns that can be safely dropped due to their missingness ratio.
+``` {r drop_missing_columns}
+# Select names of vars that have high missing ratio
+vars.to.be.removed <- missing.ratio.df %>% rownames() %>% unlist()
+
+# Remove vars
+train <- train %>% select(-all_of(vars.to.be.removed))
+```
+Finally, we'll check if any of the remaining variables are considered **near zero variance** variables with the function `nearZeroVar` from the `caret` package.
+
+``` {r check_nzv, message=FALSE, warning=FALSE}
+library(caret)
+
+# Checking the near zero variables
+nearZeroVar(train, saveMetrics = TRUE) %>% filter(nzv == TRUE)
+```
+No NZV vars are found and the data is all cleaned up. We can start the model building process.
+
+## Model Building
+
+Since we still have several potential predictors in our training set, we'll go on with two approches:
+
+- Run PCA to have a smaller dimensional space and store the principal components in a separate training set
+- Keep the original training set so we can compare accuracy between the PCA and non PCA versions of the data afterwards
+
+### Performing PCA
+We'll first remove our outcome variable from the train set and store the resulting data frame in a separate variable. Then we'll run PCA and check the variance explained in the first 10 dimensions with a scree plot.
+
+``` {r create_pca_df, message=FALSE, warning=FALSE, cache=TRUE, out.width="100%", fig.height = 3}
+# Removing the ouctome variable from the train set and storing the predictor values in a separate data frame, in order to run PCA.
+only.predictors.df <- train %>% select(-classe)
+
+# Perform PCA
+prComp <- prcomp(only.predictors.df, scale. = TRUE)
+
+library(factoextra)
+
+# Illustrating the 10 first PC
+fviz_eig(prComp)
+
+# Seeing the cumulative explained varuance of first 10 Principal Components
+as.data.frame(summary(prComp)[6][1]$importance)[,1:10]
+
+```
+
+We see that the first 10 principal components explain 76% of the variance in our training set. That seems a reasonable number, considering that we have 54 variables in total.
+
+We'll now pre process the training set with `caret` and ask it to run PCA with the first 10 principal components. Then we'll apply the PCA model transformations in the original train dataset and store the resulting reduced variable space in a separate data frame.
+
+``` {r prePocess_PCA}
+# PreProcessing with the first 10 PC
+preProc <- preProcess(only.predictors.df, method = "pca", pcaComp = 10)
+
+# Generating the values of the 10 PCs for each row of the original df
+train.principal.components <- predict(preProc, only.predictors.df)
+
+# Including the classe variable in the newest PCA data frame
+train.principal.components$classe <- train$classe
+```
+
+### Testing models
+
+Now that we have the original and a reduced version of the training set, we can start testing different models in both and see which combination yield better accuracy. In order to keep things simple, we'll start testing two simple but powerful multi-class classification algorithms: **Decision Trees (*rpart*)** and **Random Forests (*rf*)**.
+
+For all those models we'll train them and perform a 10-fold cross-validation in order to estimate the out of sample error (remember we don't have the **_classe_** variable on the test set provided, so we need to validate our model performance on the training set).
+
+#### Decision Trees
+
+``` {r decision_tree, message=FALSE, warning=FALSE, cache=TRUE}
+# Rpart with PCA dataset
+set.seed(1234)    
+modelFitPCA <- train(classe ~ ., method = "rpart", data = train.principal.components,
+                  trControl = trainControl(method = "cv", number = 10, 
+                                           savePredictions = TRUE))
+
+# Generate a table to store model performance
+accuracy.df <- cbind(as.data.frame(modelFitPCA$results) %>% 
+                         filter(Accuracy == max(Accuracy)) %>% 
+                         mutate(Model.Parameter = "cp") %>% 
+                         rename(Parameter.Value = cp) %>%
+                         relocate(Parameter.Value, .after = Model.Parameter), 
+                     data.frame(Method = "rpart", Dataset = "Train with PCA")) %>%
+    select(-AccuracySD, -KappaSD)
+
+# Rpart with train data (original variables)
+set.seed(1234)    
+modelFit <- train(classe ~ ., method = "rpart", data = train,
+                  trControl = trainControl(method = "cv", number = 10,
+                                           savePredictions = TRUE))
+
+# Binding rows to the model performance data frame
+accuracy.df <- rbind(accuracy.df,
+    cbind(as.data.frame(modelFit$results) %>% 
+                         filter(Accuracy == max(Accuracy)) %>% 
+                         mutate(Model.Parameter = "cp") %>% 
+                         rename(Parameter.Value = cp) %>%
+                         relocate(Parameter.Value, .after = Model.Parameter), 
+                     data.frame(Method = "rpart", Dataset = "Train without PCA")) %>%
+        select(-AccuracySD, -KappaSD))
+
+accuracy.df
+```
+
+We got a slightly better performance on the decision tree with the original data. However, the estimated accuracy is not great and the kappa levels are not so good either. We'll do the same approach with random forests.
+
+#### Random Forests
+
+``` {r random_forest, message=FALSE, warning=FALSE, cache=TRUE, fig.height = 5}
+# Rf with PCA dataset
+set.seed(1234)    
+modelFitPCA <- train(classe ~ ., method = "rf", data = train.principal.components,
+                  ntree = 4,
+                  trControl = trainControl(method = "cv", number = 10,
+                                           savePredictions = TRUE))
+
+# Binding rows to the model performance data frame
+accuracy.df <- rbind(accuracy.df,
+    cbind(as.data.frame(modelFitPCA$results) %>% 
+                         filter(Accuracy == max(Accuracy)) %>% 
+                         mutate(Model.Parameter = "mtry") %>% 
+                         rename(Parameter.Value = mtry) %>%
+                         relocate(Parameter.Value, .after = Model.Parameter), 
+                     data.frame(Method = "rf", Dataset = "Train with PCA")) %>%
+        select(-AccuracySD, -KappaSD))
+
+# Rpart with train data (original variables)
+set.seed(1234)    
+modelFit <- train(classe ~ ., method = "rf", data = train, ntree = 4,
+                  trControl = trainControl(method = "cv", number = 10,
+                                           savePredictions = TRUE))
+
+# Binding rows to the model performance data frame
+accuracy.df <- rbind(accuracy.df,
+    cbind(as.data.frame(modelFit$results) %>% 
+                         filter(Accuracy == max(Accuracy)) %>% 
+                         mutate(Model.Parameter = "mtry") %>% 
+                         rename(Parameter.Value = mtry) %>%
+                         relocate(Parameter.Value, .after = Model.Parameter), 
+                     data.frame(Method = "rf", Dataset = "Train without PCA")) %>%
+        select(-AccuracySD, -KappaSD))
+
+accuracy.df
+```
+
+We got way better results with random forests, either with the PCA as well as with the non-PCA variables.
+
+## Conclusions
+
+Among all the tested models, a random forest on the **non-PCA training data** with parameters mtry = 27 and ntree = 4 had the best model performance (higher accuracy and kappa). The estimated out of sample error is about `r paste0(format(round(((1-(accuracy.df %>% filter(Method == "rf" & Dataset == "Train without PCA") %>% select(Accuracy))) * 100), digits = 2), nsmall = 2), "%")`. 
+
+Before closing, we'll have a look on the 10 most important variables estimated by the chosen random forest model.
+``` {r varImpPlot, fig.width=8}
+
+imp.plot <- varImp(modelFit)$importance
+imp.plot <- head(imp.plot, 10)
+ggplot(imp.plot, aes(x = forcats::fct_reorder(rownames(imp.plot), Overall), y = Overall)) +
+    geom_segment(aes(xend = rownames(imp.plot), yend = 0)) +
+    geom_point(size = 4, color = "steelblue") +
+    coord_flip() +
+    theme_bw() +
+    xlab("") + ylab("Importance") +
+    ylim(c(0, max(imp.plot$Overall) * 1.1)) +
+    geom_text(aes(x = forcats::fct_reorder(rownames(imp.plot), Overall), y = Overall + 5, label = format(round(Overall, digits = 2), nsmall = 2)), nudge_y = 1.7) +
+    ggtitle(label = 'Importance of Variables when predicting "classe" (Top 10)',
+            subtitle = "Random Forest model on the non-PCA variables with ntree=4 and mtry=27")
+
+```
+
+The **_roll_belt_** variable was the most important feature when determining the accuracy of the exercise performed by the subjects.
+Although these results may indicate an overfitted model, it scored 100% on the 20 observations in the test set (graded in Coursera), so it performed well on new observations as well.
+It is important to mention the results obtained with random forests in the PCA dataset. Although its accuracy wasn't as high as the non-PCA training data, it was able to achieve a high prediction accuracy with much smaller dimension space and with a smaller mtry paramater value. The PCA random forest model is less likely to be overfit.
